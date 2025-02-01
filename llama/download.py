@@ -1,9 +1,9 @@
 import os
 import tyro
 import torch
-import ml_dtypes
 import jax.numpy as jnp
 from pathlib import Path
+import ml_dtypes
 
 from transformers import AutoModelForCausalLM
 from unittest.mock import patch
