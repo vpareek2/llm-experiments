@@ -25,7 +25,3 @@ To use the `llama` model, adjust the prompt in `main.py` and then run
 ```
 python main.py
 ```
-
-## Credit
-
-This implementation is inspired by the [xjdr-alt/entropix repository](https://github.com/xjdr-alt/entropix/tree/main). I like the programming style.
