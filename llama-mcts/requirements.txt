@@ -1,0 +1,7 @@
+jax==0.4.38
+ml_dtypes==0.4.0
+numpy==2.2.2
+tiktoken==0.8.0
+torch==2.1.0
+transformers==4.48.0
+tyro==0.8.14
