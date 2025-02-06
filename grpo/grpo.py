@@ -126,7 +126,7 @@ class GRPOTrainer:
             advantage = advantages[i]
 
             # Compute clipped objective
-            obj1 = ratio * advantages
+            obj1 = ratio * advantage
             obj2 = torch.clamp(ratio, 1 - self.config.eps, 1 + self.config.eps) * advantage
             obj = -torch.min(obj1, obj2).mean()
 
