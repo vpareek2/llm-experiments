@@ -1,282 +1,164 @@
-#!/usr/bin/env python3
-"""
-grpo_functions.py
-
-This file contains function declarations for a GRPO training implementation.
-Fill in the implementations later as needed.
-"""
-
 import torch
 import torch.nn.functional as F
-import math
-from typing import List, Tuple, Callable, Optional, Dict, Any
+from torch.optim import AdamW
+from typing import List, Callable, Optional, Dict, Any
+from dataclasses import dataclass
 
-# Type alias for reward functions:
-RewardFn = Callable[[torch.Tensor, Dict[str, Any]], float]
+@dataclass
+class GRPOConfig:
+    """Configuration for GRPO"""
 
-###############################################################################
-# Sampling and Data Preparation Functions
-###############################################################################
+    learning_rate: float = 5e-6
+    num_train_epochs: int = 1
+    per_device_train_batch_size: int = 1
+    gradient_accumulation_steps: int = 4
+    num_generations: int = 16   # Group size for sampling
+    max_prompt_length: int = 256
+    max_completion_length: int = 786
+    max_grad_norm: float = 0.1
+    kl_coeff: float = 0.04 # KL penalty coefficient
+    eps: float = 0.2 # Clipping parameter
 
-def sample_group(
-    model: torch.nn.Module, 
-    prompt: Dict[str, Any], 
-    group_size: int, 
-    max_length: int
-) -> List[torch.Tensor]:
-    """
-    Given a prompt, sample a group of outputs using the provided model.
+class GRPOTrainer:
+    def __init__(self, model: torch.nn.Module, tokenizer: Any, reward_funcs: List[Callable], train_dataset: Any, config: GRPOConfig):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.reward_funcs = reward_funcs
+        self.train_dataset = train_dataset
+        self.config = config
+
+        self.optimizer = AdamW(model.parameters(), lr=config.learning_rate)
+
+        self.ref_model = type(model)(model.config).to(model.device)
+        self.ref_model.load_state_dict(model.state_dict())
+        self.ref_model.eval()
     
-    Args:
-        model: The policy model used for sampling.
-        prompt: A dictionary representing the prompt (e.g., conversation history).
-        group_size: Number of outputs to sample.
-        max_length: Maximum length for each output.
+    def generate_group(self, prompt_ids: torch.Tensor) -> List[torch.Tensor]:
+        """Generate multiple responses for each prompt"""
+
+        outputs = []
+
+        for _ in range(self.config.num_generations):
+            with torch.no_grad():
+                output = self.model.generate(
+                    prompt_ids,
+                    max_length=self.config.max_completion_length,
+                    do_sample=True,
+                    top_p=0.95,
+                    temperature=0.7,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+                outputs.append(output)
+
+        return outputs
+    
+    def compute_rewards(self, prompts: List[dict], completions: List[dict], answers: List[str]) -> torch.Tensor:
+        """Compute combined rewards from all reward functions"""
         
-    Returns:
-        A list of output tensors (each representing a token sequence).
-    """
-    pass
+        total_rewards = torch.zeros(len(completions))
 
-###############################################################################
-# Reward and Advantage Computation Functions
-###############################################################################
+        for reward_func in self.reward_funcs:
+            rewards = reward_func(prompts=prompts, completions=completions, answers=answers)
+            total_rewards += torch.tensor(rewards, dtype=torch.float)
 
-def compute_rewards(
-    outputs: List[torch.Tensor], 
-    prompt: Dict[str, Any], 
-    reward_fns: List[RewardFn]
-) -> torch.Tensor:
-    """
-    Compute raw rewards for each output by aggregating multiple reward functions.
+        return total_rewards
     
-    Args:
-        outputs: List of output tensors sampled from the model.
-        prompt: The input prompt corresponding to the outputs.
-        reward_fns: A list of reward function callables.
+    def compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
+        """Compute advantages using group normalization"""
+
+        mean_reward = rewards.mean()
+        std_reward = rewards.std()
+        if std_reward == 0:
+            std_reward = 1
         
-    Returns:
-        A 1D tensor of raw rewards (one per output).
-    """
-    pass
-
-def normalize_rewards(
-    rewards: torch.Tensor
-) -> torch.Tensor:
-    """
-    Normalize rewards by subtracting the mean and dividing by the standard deviation.
+        return (rewards - mean_reward) / std_reward
     
-    Args:
-        rewards: A tensor of raw rewards.
+    def compute_kl_divergence(self, policy_logits: torch.Tensor, ref_logits: torch.Tensor) -> torch.Tensor:
+        """Compute KL divergence between policy and reference model"""
         
-    Returns:
-        A tensor of normalized rewards.
-    """
-    pass
+        policy_probs = F.softmax(policy_logits, dim=-1)
+        ref_probs = F.softmax(ref_logits, dim=-1)
 
-def compute_advantages(
-    outputs: List[torch.Tensor],
-    normalized_rewards: torch.Tensor
-) -> List[torch.Tensor]:
-    """
-    Compute token-level advantages for each output based on normalized rewards.
-    For outcome supervision, each token in an output may receive the same advantage.
-    
-    Args:
-        outputs: List of output tensors.
-        normalized_rewards: Normalized reward tensor corresponding to the group.
+        # Using unbaised estimator from paper
+        ratio = ref_probs / (policy_probs + 1e-8)
+        kl = ratio - torch.log(ratio) - 1
+        return kl.mean()
+
+    def train_step(self, batch: Dict[str, Any]) -> float:
+        """Execute a single training step"""
+
+        self.model.train()
+        total_loss = 0
+
+        # Get prompts and answers
+        prompts = batch['prompt']
+        answers = batch['answer']
+
+        # Tokenize prompts
+        prompt_ids = self.tokenizer(prompts, return_tensors='pt', padding=True, truncation=True).to(self.model.device)
         
-    Returns:
-        A list of advantage tensors, one for each output.
-    """
-    pass
+        # Generate group of responses
+        completion_ids = self.generate_group(prompt_ids['input_ids'])
 
-###############################################################################
-# Log-Probability and KL Computation Functions
-###############################################################################
+        # Decode completions
+        completions = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in completion_ids]
 
-def compute_log_probs(
-    model: torch.nn.Module, 
-    prompt: Dict[str, Any], 
-    output: torch.Tensor
-) -> torch.Tensor:
-    """
-    Compute token-level log probabilities for a given output conditioned on the prompt.
-    
-    Args:
-        model: The model to compute log probabilities.
-        prompt: The input prompt as a dictionary.
-        output: The output tensor (token IDs).
+        # Compute rewards and advantages
+        rewards = self.compute_rewards(prompts, completions, answers)
+        advantages = self.compute_advantages(rewards)
+
+        # Forward pass for policy and reference logits
+        for i, completion_id in enumerate(completion_ids):
+            outputs = self.model(completion_id)
+            ref_outputs = self.ref_model(completion_id)
+
+            policy_logits = outputs.logits
+            ref_logits = ref_outputs.logits
+
+            # Compute KL divergence
+            kl_div = self.compute_kl_divergence(policy_logits, ref_logits)
+
+            # Compute policy ratio and clipped objective
+            log_probs = F.log_softmax(policy_logits, dim=-1)
+            old_log_probs = F.log_softmax(ref_logits, dim=-1)
+            ratio = torch.exp(log_probs - old_log_probs)
+
+            advantage = advantages[i]
+
+            # Compute clipped objective
+            obj1 = ratio * advantages
+            obj2 = torch.clamp(ratio, 1 - self.config.eps, 1 + self.config.eps) * advantage
+            obj = -torch.min(obj1, obj2).mean()
+
+            # Add KL penalty
+            loss = obj + self.config.kl_coeff * kl_div
+
+            # Scale loss and backward
+            scaled_loss = loss / self.config.gradient_accumulation_steps
+            scaled_loss.backward()
+
+            total_loss += loss.item()
         
-    Returns:
-        A tensor of log probabilities for each token in the output.
-    """
-    pass
+        # Gradient clipping and optimizer step
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
 
-def compute_policy_ratio(
-    current_log_probs: torch.Tensor, 
-    old_log_probs: torch.Tensor
-) -> torch.Tensor:
-    """
-    Compute the token-level policy ratio, i.e. exp(current_log_probs - old_log_probs).
-    
-    Args:
-        current_log_probs: Log probabilities from the current model.
-        old_log_probs: Log probabilities from the old (sampling) model.
+        if (self.steps + 1) % self.config.gradient_accumulation_steps == 0:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
         
-    Returns:
-        A tensor of policy ratios.
-    """
-    pass
-
-def compute_token_kl(
-    current_log_probs: torch.Tensor, 
-    reference_log_probs: torch.Tensor
-) -> torch.Tensor:
-    """
-    Compute token-level KL divergence between current and reference model log probabilities.
+        return total_loss / len(completion_ids)
     
-    Args:
-        current_log_probs: Log probabilities from the current model.
-        reference_log_probs: Log probabilities from the reference model.
-        
-    Returns:
-        A tensor of KL divergence values for each token.
-    """
-    pass
+    def train(self):
+        """Train the model"""
 
-###############################################################################
-# GRPO Loss and Update Functions
-###############################################################################
+        self.steps = 0
+        self.model.train()
 
-def grpo_loss_for_group(
-    current_log_probs: List[torch.Tensor],
-    old_log_probs: List[torch.Tensor],
-    advantages: List[torch.Tensor],
-    kl_divs: List[torch.Tensor],
-    epsilon: float,
-    kl_coef: float
-) -> torch.Tensor:
-    """
-    Compute the GRPO loss over a group of outputs.
-    
-    The loss includes:
-      - A clipped policy ratio term weighted by the computed advantages.
-      - A KL divergence penalty term compared against a reference model.
-    
-    Args:
-        current_log_probs: List of token log probability tensors from the current model.
-        old_log_probs: List of token log probability tensors from the old model.
-        advantages: List of token advantage tensors for each output.
-        kl_divs: List of token-level KL divergence tensors for each output.
-        epsilon: Clipping parameter.
-        kl_coef: Coefficient for the KL penalty term.
-        
-    Returns:
-        A scalar tensor representing the GRPO loss for the group.
-    """
-    pass
+        for epoch in range(self.config.num_train_epochs):
+            for batch_idx, batch in enumerate(self.train_dataset):
+                loss = self.train_step(batch)
 
-def grpo_update_step(
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    prompt: Dict[str, Any],
-    group_size: int,
-    max_length: int,
-    reward_fns: List[RewardFn],
-    epsilon: float,
-    kl_coef: float,
-    old_model: torch.nn.Module,
-    reference_model: torch.nn.Module
-) -> float:
-    """
-    Perform one GRPO update step for a given prompt.
-    
-    This function should:
-      1. Sample a group of outputs using `sample_group`.
-      2. Compute raw rewards via `compute_rewards`.
-      3. Normalize rewards and compute advantages.
-      4. Compute token-level log probabilities (current and old) using `compute_log_probs`.
-      5. Compute token-level KL divergence using `compute_token_kl`.
-      6. Compute the GRPO loss using `grpo_loss_for_group`.
-      7. Backpropagate and update the model parameters.
-    
-    Args:
-        model: The current policy model.
-        optimizer: Optimizer for the model.
-        prompt: Input prompt dictionary.
-        group_size: Number of outputs to sample.
-        max_length: Maximum output length.
-        reward_fns: List of reward function callables.
-        epsilon: Clipping parameter for the policy ratio.
-        kl_coef: Coefficient for the KL divergence penalty.
-        old_model: The old policy model used for sampling.
-        reference_model: The reference model for computing KL divergence.
-        
-    Returns:
-        The scalar loss value from the update step.
-    """
-    pass
-
-###############################################################################
-# Optional Reward Model Update and Iterative Training Functions
-###############################################################################
-
-def update_reward_model(
-    reward_model: torch.nn.Module, 
-    training_data: torch.Tensor, 
-    optimizer: torch.optim.Optimizer
-) -> None:
-    """
-    Update the reward model using the provided training data.
-    
-    Args:
-        reward_model: The reward model to update.
-        training_data: Tensor containing training examples for the reward model.
-        optimizer: Optimizer for the reward model.
-    """
-    pass
-
-def iterative_grpo_training_loop(
-    model: torch.nn.Module,
-    data_loader: torch.utils.data.DataLoader,
-    reward_model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    group_size: int,
-    max_length: int,
-    reward_fns: List[RewardFn],
-    epsilon: float,
-    kl_coef: float,
-    update_reward_every: int,
-    num_epochs: int
-) -> None:
-    """
-    High-level iterative training loop for GRPO.
-    
-    This loop should:
-      - Iterate over the dataset (using data_loader).
-      - For each prompt, perform a GRPO update step.
-      - Periodically update the reward model (if applicable).
-      
-    Args:
-        model: The current policy model.
-        data_loader: DataLoader providing prompts and any necessary context.
-        reward_model: The reward model used to score outputs.
-        optimizer: Optimizer for the policy model.
-        group_size: Number of outputs to sample per prompt.
-        max_length: Maximum output length.
-        reward_fns: List of reward function callables.
-        epsilon: Clipping parameter for GRPO.
-        kl_coef: Coefficient for the KL penalty.
-        update_reward_every: Frequency (in steps) to update the reward model.
-        num_epochs: Number of training epochs.
-    """
-    pass
-
-###############################################################################
-# Main (Optional Entry Point)
-###############################################################################
-
-if __name__ == "__main__":
-    # Optional: Initialize models, optimizers, data loaders, etc., and call iterative_grpo_training_loop.
-    pass
+                if batch_idx % 10 == 0:
+                    print(f"Epoch {epoch}, Batch {batch_idx}, Loss: {loss:.4f}")
+                
+                self.steps += 1
