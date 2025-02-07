@@ -154,9 +154,7 @@ def xmlcount_reward_func(completions, **kwargs) -> list[float]:
 # GRPO Core Functionality
 # ------------------------------------------------------------------------
 def sample_group(prompt: str, model: AutoModelForCausalLM, tokenizer: AutoTokenizer, config: GRPOConfig) -> List[str]:
-    """
-    Generate G completions for a single prompt
-    """
+    """Generate G completions for a single prompt"""
 
     # Format prompt with XML tags
     formatted_prompt = format_prompt(prompt)
@@ -179,24 +177,59 @@ def sample_group(prompt: str, model: AutoModelForCausalLM, tokenizer: AutoTokeni
         
     return completions
     
-def calculate_group_advantages(rewards: List[float], group_size: int):
-    """Calculates advantages as per DeepSeekMath paper.
-    Takes rewards for a group of outputs 
-    Calculates mean and std
-    Returns normalized advantages using formula: advantages = (rewards - mean(rewards)) / std(rewards)
-    """
-    pass
+def calculate_group_advantages(rewards: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Calculate advantages using group normalization from the GRPO paper."""
+    # Reshape rewards to (B, G) to process each group
+    grouped_rewards = rewards.view(-1, group_size)
+    
+    # Calculate mean and std for each group
+    group_means = grouped_rewards.mean(dim=1, keepdim=True)  # (B, 1)
+    group_stds = grouped_rewards.std(dim=1, keepdim=True)    # (B, 1)
+    
+    # Normalize each group: (r - mean)/(std + eps)
+    advantages = (grouped_rewards - group_means)/(group_stds + 1e-8)
+    
+    # Reshape back to (B*G)
+    return advantages.view(-1)
 
-def calculate_kl_divergence(current_logits, ref_logits):
-    """Implements KL divergence estimator from paper"""
-    pass
+def calculate_kl_divergence(current_logits: torch.Tensor, ref_logits: torch.Tensor) -> torch.Tensor:
+    """Calculate KL divergence using unbiased estimator from GRPO paper"""
+    ratio = torch.exp(ref_logits - current_logits)
+    kl = ratio - (ref_logits - current_logits) - 1.0
+    return kl
 
-def calculate_policy_ratio(current_logits, old_logits):
+def calculate_policy_ratio(current_logits: torch.Tensor, old_logits:torch.Tensor):
     """Calculates new vs old ratio"""
+    return torch.exp(current_logits - old_logits)
 
-def calculate_grpo_loss(policy_ratios, advantages, kl_divergence):
-    """Calculates GRPO loss as per paper"""
-    pass
+def calculate_grpo_loss(
+    policy_ratio: torch.Tensor,
+    advantages: torch.Tensor,
+    kl_div: torch.Tensor,
+    beta: float = 0.04,
+    epsilon: float = 0.2,
+    mask: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Calculate GRPO loss from equation (3) in paper."""
+    # PPO-style clipping
+    ratio_clipped = torch.clamp(policy_ratio, 1 - epsilon, 1 + epsilon)
+    
+    # Policy gradient loss terms
+    pg_loss1 = policy_ratio * advantages
+    pg_loss2 = ratio_clipped * advantages
+    pg_loss = -torch.min(pg_loss1, pg_loss2)  # Negative because we want to maximize
+
+    # Add KL penalty
+    loss = pg_loss + beta * kl_div
+    
+    # Apply mask if provided
+    if mask is not None:
+        loss = loss * mask
+        loss = loss.sum() / mask.sum()  # Average over non-padded tokens
+    else:
+        loss = loss.mean()
+        
+    return loss
 
 # ------------------------------------------------------------------------
 # Training Loop
