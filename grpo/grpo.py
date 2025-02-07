@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from datasets import load_dataset, Dataset
 from typing import List, Optional, Tuple
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
 
 # ------------------------------------------------------------------------
 # CONFIG
@@ -14,11 +14,34 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 @dataclass
 class GRPOConfig:
     """Config for GRPO"""
+
+    num_generations: int = 64 # G in paper
+    max_length: int = 512
+    temperature: float = 0.7
+
     model_name: str = "meta-llama/Llama-3.2-1B"
     output_dir: str = "outputs/Llama-1B-GRPO"
     run_name: str = "Llama-1B-GRPO"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
+# ------------------------------------------------------------------------
+# HELPERS
+# ------------------------------------------------------------------------
+def maybe_apply_chat_template(example: dict, tokenizer) -> dict:
+    """Apply chat template if the example is in conversational format"""
+    if isinstance(example.get("prompt"), list):  # If prompt is a list of messages
+        return {"prompt": tokenizer.apply_chat_template(example["prompt"])}
+    return {"prompt": example["prompt"]}  # Otherwise return as is
+
+def is_conversational(example: dict) -> bool:
+    """Check if example is in conversational format"""
+    return isinstance(example.get("prompt"), list)
+
+def format_prompt(text: str) -> str:
+    """Add XML tags if not present"""
+    if not text.startswith("<reasoning>"):
+        return f"<reasoning>\n{text}\n</reasoning>\n<answer>\n"
+    return text
 # ------------------------------------------------------------------------
 # DATA LOADING & PREPROCESSING
 # ------------------------------------------------------------------------
@@ -130,17 +153,35 @@ def xmlcount_reward_func(completions, **kwargs) -> list[float]:
 # ------------------------------------------------------------------------
 # GRPO Core Functionality
 # ------------------------------------------------------------------------
-def sample_group(prompt, model, tokenizer, num_samples) -> List[str]:
-    """Sample num_samples completions from the model
-    Takes a prompt and generated G (e.g. 64) outputs
-    Handles tokenization and model generation
-    Returns a list of outputs for each prompt
+def sample_group(prompt: str, model: AutoModelForCausalLM, tokenizer: AutoTokenizer, config: GRPOConfig) -> List[str]:
     """
-    pass
+    Generate G completions for a single prompt
+    """
 
+    # Format prompt with XML tags
+    formatted_prompt = format_prompt(prompt)
+    
+    # Tokenize
+    inputs = tokenizer(formatted_prompt, return_tensors="pt").to(config.device)
+    
+    # Generate G completions
+    completions = []
+    for _ in range(config.num_generations):
+        outputs = model.generate(
+            **inputs,
+            max_length=config.max_length,
+            temperature=config.temperature,
+            do_sample=True,
+            pad_token_id=tokenizer.pad_token_id
+        )
+        text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        completions.append(text)
+        
+    return completions
+    
 def calculate_group_advantages(rewards: List[float], group_size: int):
     """Calculates advantages as per DeepSeekMath paper.
-    Takes rewards for a group of outputs
+    Takes rewards for a group of outputs 
     Calculates mean and std
     Returns normalized advantages using formula: advantages = (rewards - mean(rewards)) / std(rewards)
     """
