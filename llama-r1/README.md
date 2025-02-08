@@ -47,9 +47,7 @@ Charles picked 50 pears, so the number of bananas he cooked is 3 * 50 = 150. San
 **Extracted:**  
 160  
 
----
-
-## Question  
+---  
 
 **Question:**  
 After being contracted to build 4000 bollards on each side of a road, a company was only able to install 3/4 of the total number of bollards required on all sides of the road. How many more bollards are they required to install on all sides of the remaining part of the road?  
